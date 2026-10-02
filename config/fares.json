@@ -1,0 +1,20 @@
+{
+  "currency": "CNY",
+  "transfer_window_minutes": 90,
+  "transfer_discount_cents": 100,
+  "daily_cap_cents": 1500,
+  "weekly_cap_cents": 5000,
+  "stations": {
+    "S01": 1, "S02": 1, "S03": 1,
+    "S04": 2, "S05": 2, "S06": 2,
+    "S07": 3, "S08": 3, "S09": 3
+  },
+  "zone_fares": {
+    "1-1": 300,
+    "1-2": 500,
+    "1-3": 800,
+    "2-2": 300,
+    "2-3": 500,
+    "3-3": 300
+  }
+}

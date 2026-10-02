@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - transit-data:/data
+    environment:
+      DB_PATH: /data/transit.db
+      FARE_CONFIG: /srv/app/config/fares.json
+      # Server-side secret for stable HMAC passenger pseudonymisation in
+      # POST /privacy/exports. Keep it stable (changing it rotates every
+      # pseudonym) and override the development default in production, e.g.
+      #   PRIVACY_SALT=$(openssl rand -hex 32) docker compose up --build
+      PRIVACY_SALT: ${PRIVACY_SALT:-dev-only-privacy-salt-change-me}
+    restart: unless-stopped
+
+volumes:
+  transit-data:
