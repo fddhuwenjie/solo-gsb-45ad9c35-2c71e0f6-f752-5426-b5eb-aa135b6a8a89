@@ -186,6 +186,59 @@ def charge_row(trip: Trip) -> tuple:
     )
 
 
+def build_charge_adjustments(
+    trips: list[Trip], old_charges: dict[str, int]
+) -> list[dict]:
+    """Diff newly priced trips against the previously persisted per-trip
+    amounts. Trips whose id disappeared after re-pairing show up as negative
+    reversals with a ``voided`` basis. Pure: it neither reads nor writes."""
+    new_charges = {t.trip_id: t.amount_cents for t in trips}
+
+    adjustments: list[dict] = []
+    for trip in trips:
+        old = old_charges.get(trip.trip_id)
+        new = trip.amount_cents
+        if old != new:
+            adjustments.append(
+                {
+                    "trip_id": trip.trip_id,
+                    "day_key": trip.day_key,
+                    "week_key": trip.week_key,
+                    "old_amount_cents": old if old is not None else 0,
+                    "new_amount_cents": new,
+                    "delta_cents": new - (old if old is not None else 0),
+                    "basis": trip.basis,
+                }
+            )
+    for trip_id, old in old_charges.items():
+        if trip_id not in new_charges:
+            adjustments.append(
+                {
+                    "trip_id": trip_id,
+                    "day_key": None,
+                    "week_key": None,
+                    "old_amount_cents": old,
+                    "new_amount_cents": 0,
+                    "delta_cents": -old,
+                    "basis": {"voided": True, "reason": "trip no longer exists after re-pairing"},
+                }
+            )
+    return adjustments
+
+
+def simulate_passenger(
+    events: list[Event], old_charges: dict[str, int], cfg: FareConfig
+) -> tuple[list[Trip], list[Pending], list[dict]]:
+    """Pair and price a hypothetical event list without persisting anything.
+    Returns the priced trips, the pending events and the charge adjustments
+    against ``old_charges``. Used by the correction impact preview, which must
+    run the exact settlement rules in memory and never touch stored data."""
+    trips, pending = pair_trips(events)
+    price_trips(trips, cfg)
+    adjustments = build_charge_adjustments(trips, old_charges)
+    return trips, pending, adjustments
+
+
 def settle_passenger(conn, cfg: FareConfig, passenger_id: str) -> list[dict]:
     """Recompute a passenger's full settlement, persist it, and return the
     list of adjustments (per-trip old/new amounts and billing basis).
@@ -220,37 +273,7 @@ def settle_passenger(conn, cfg: FareConfig, passenger_id: str) -> list[dict]:
             (passenger_id,),
         )
     }
-    new_charges = {t.trip_id: t.amount_cents for t in trips}
-
-    adjustments: list[dict] = []
-    for trip in trips:
-        old = old_charges.get(trip.trip_id)
-        new = trip.amount_cents
-        if old != new:
-            adjustments.append(
-                {
-                    "trip_id": trip.trip_id,
-                    "day_key": trip.day_key,
-                    "week_key": trip.week_key,
-                    "old_amount_cents": old if old is not None else 0,
-                    "new_amount_cents": new,
-                    "delta_cents": new - (old if old is not None else 0),
-                    "basis": trip.basis,
-                }
-            )
-    for trip_id, old in old_charges.items():
-        if trip_id not in new_charges:
-            adjustments.append(
-                {
-                    "trip_id": trip_id,
-                    "day_key": None,
-                    "week_key": None,
-                    "old_amount_cents": old,
-                    "new_amount_cents": 0,
-                    "delta_cents": -old,
-                    "basis": {"voided": True, "reason": "trip no longer exists after re-pairing"},
-                }
-            )
+    adjustments = build_charge_adjustments(trips, old_charges)
 
     paired_ids = {t.in_event.event_id for t in trips} | {t.out_event.event_id for t in trips}
     pending_by_id = {p.event.event_id: p.reason for p in pending}

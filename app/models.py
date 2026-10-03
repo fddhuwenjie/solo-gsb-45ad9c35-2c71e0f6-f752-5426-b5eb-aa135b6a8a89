@@ -33,6 +33,121 @@ class EventResult(BaseModel):
     adjustments: list[Adjustment]
 
 
+# ---------------------------------------------------------------------------
+# Correction impact preview (更正影响预览)
+# ---------------------------------------------------------------------------
+
+
+class CorrectionPreviewIn(BaseModel):
+    event_id: str = Field(min_length=1, max_length=128)
+    passenger_id: str = Field(min_length=1, max_length=128)
+    station_id: str = Field(min_length=1, max_length=64)
+    tap_type: Literal["in", "out"]
+    occurred_at: datetime  # any ISO-8601 offset accepted, normalised to UTC
+
+
+class PreviewTrip(BaseModel):
+    trip_id: str
+    passenger_id: str
+    from_station: str
+    to_station: str
+    from_zone: int
+    to_zone: int
+    started_at: str
+    ended_at: str
+    day_key: str
+    week_key: str
+    base_fare_cents: int
+    transfer_discount_cents: int
+    amount_cents: int
+    basis: dict
+
+
+class PassengerPreview(BaseModel):
+    passenger_id: str
+    old_trips: list[PreviewTrip]
+    new_trips: list[PreviewTrip]
+    adjustments: list[Adjustment]
+    old_total_cents: int
+    new_total_cents: int
+    delta_cents: int
+
+
+class ReconImpactItem(BaseModel):
+    batch_id: str
+    trip_id: str | None = None
+    serial_no: str | None = None
+    passenger_id: str
+    category: str | None = None
+    match_method: str | None = None
+    change_code: str
+    reason: str
+
+
+class ClearingImpactOperatorDelta(BaseModel):
+    operator_id: str
+    booked_cents: int
+    target_cents: int
+    delta_cents: int
+
+
+class ClearingImpactTrip(BaseModel):
+    trip_id: str | None = None
+    change_code: str
+    reason: str
+    old_from_station: str | None = None
+    old_to_station: str | None = None
+    new_from_station: str | None = None
+    new_to_station: str | None = None
+    old_gross_cents: int = 0
+    new_gross_cents: int = 0
+    delta_cents: int
+    operators: list[ClearingImpactOperatorDelta]
+
+
+class ClearingImpact(BaseModel):
+    base_clearing_id: str
+    window_start: str
+    window_end: str
+    trips: list[ClearingImpactTrip]
+    delta_cents: int
+    rule_coverage: Literal["covered", "uncovered"]
+    uncovered_station_pairs: list[str]
+
+
+class DisputeImpact(BaseModel):
+    dispute_id: str
+    passenger_id: str
+    trip_id: str
+    state: Literal["resolved"]
+    change_code: str
+    reason: str
+    frozen_amount_cents: int
+    refunded_cents: int
+    net_paid_cents: int
+    old_current_cents: int
+    new_current_cents: int
+    old_difference_cents: int
+    new_difference_cents: int
+    old_direction: Literal["none", "top_up_due", "clawback_due"]
+    new_direction: Literal["none", "top_up_due", "clawback_due"]
+
+
+class CorrectionPreviewOut(BaseModel):
+    event_id: str
+    status: Literal["preview", "no_change"]
+    currency: str
+    simulated_passengers: list[str]
+    passengers: list[PassengerPreview]
+    total_delta_cents: int
+    reconciliation_impacts: list[ReconImpactItem]
+    clearing_impacts: list[ClearingImpact]
+    resolved_dispute_impacts: list[DisputeImpact]
+    affected_batch_count: int
+    affected_clearing_count: int
+    affected_resolved_dispute_count: int
+
+
 class PendingEvent(BaseModel):
     event_id: str
     passenger_id: str

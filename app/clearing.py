@@ -234,3 +234,117 @@ def last_seen_trips(
             "gross_amount_cents": r["gross_amount_cents"],
         }
     return latest
+
+
+def plan_adjustment_entries(
+    rules_by_pair: dict[tuple[str, str], list[tuple[str, int]]],
+    current_trips: list[dict],
+    prior: dict[tuple[str, str], int],
+    seen_before: dict[str, dict],
+    trip_filter: set[str] | None = None,
+) -> dict:
+    """Compute the adjustment batch that would bring one clearing chain from
+    its booked positions to the targets implied by ``current_trips``.
+
+    Pure: no database access, no persistence. For every current trip the
+    per-operator target is split from the current charge and reduced by the
+    cumulative amount already booked across earlier chain batches; trips the
+    chain has seen but that are no longer present are reversed to zero.
+
+    ``trip_filter`` restricts the output to a set of trip ids (used by the
+    correction preview, which only reports chain effects attributable to the
+    simulated correction); chain-level problems such as frozen-rule coverage
+    gaps are still computed for the whole current window.
+
+    Returns ``entries`` (signed per-trip / per-operator delta dicts, sorted by
+    ended_at/trip_id/operator), ``gross_total`` (sum of the current trips'
+    grosses) and ``missing_pairs`` (directed station pairs of current trips the
+    frozen rules do not cover).
+    """
+    missing = sorted(
+        {f"{t['from_station']}->{t['to_station']}"
+         for t in current_trips
+         if (t["from_station"], t["to_station"]) not in rules_by_pair}
+    )
+
+    current_ids = {t["trip_id"] for t in current_trips}
+    vanished_ids = sorted(set(seen_before) - current_ids)
+    if trip_filter is not None:
+        vanished_ids = [tid for tid in vanished_ids if tid in trip_filter]
+
+    entries: list[dict] = []
+    gross_total = 0
+    reversed_count = 0
+    prior_ops_by_trip: dict[str, set[str]] = {}
+    for (tid, op) in prior:
+        prior_ops_by_trip.setdefault(tid, set()).add(op)
+    for trip in current_trips:
+        pair = (trip["from_station"], trip["to_station"])
+        if pair not in rules_by_pair:
+            # Coverage gap: reported separately via missing_pairs. The caller
+            # decides whether to reject (the live endpoint, 422) or report it
+            # (the correction preview), so no target split is attempted here.
+            continue
+        shares = rules_by_pair[pair]
+        targets = split_amount(trip["amount_cents"], shares)
+        gross_total += trip["amount_cents"]
+        # Include operators booked under the trip's previous station pair:
+        # a correction can move the same trip_id onto a different pair with
+        # a different operator set, and the operators dropped by the new
+        # rule must be reversed to zero (target 0) rather than left booked.
+        all_operators = {op for op, _bp in shares} | prior_ops_by_trip.get(
+            trip["trip_id"], set()
+        )
+        for operator_id in sorted(all_operators):
+            prev_amount = prior.get((trip["trip_id"], operator_id), 0)
+            target = targets.get(operator_id, 0)
+            delta = target - prev_amount
+            if delta == 0:
+                continue
+            entries.append({
+                "trip_id": trip["trip_id"],
+                "passenger_id": trip["passenger_id"],
+                "from_station": trip["from_station"],
+                "to_station": trip["to_station"],
+                "ended_at": trip["ended_at"],
+                "operator_id": operator_id,
+                "basis_points": None,
+                "gross_amount_cents": trip["amount_cents"],
+                "amount_cents": delta,
+                "prior_amount_cents": prev_amount,
+                "cumulative_amount_cents": prev_amount + delta,
+            })
+    for trip_id in vanished_ids:
+        last = seen_before[trip_id]
+        # Reverse whatever earlier batches booked, per operator, so the
+        # disappeared trip nets to zero.
+        operators = sorted(
+            op for (tid, op) in prior if tid == trip_id and prior[(tid, op)] != 0
+        )
+        if operators:
+            reversed_count += 1
+        for operator_id in operators:
+            prev_amount = prior[(trip_id, operator_id)]
+            entries.append({
+                "trip_id": trip_id,
+                "passenger_id": last["passenger_id"],
+                "from_station": last["from_station"],
+                "to_station": last["to_station"],
+                "ended_at": last["ended_at"],
+                "operator_id": operator_id,
+                "basis_points": None,
+                "gross_amount_cents": 0,
+                "amount_cents": -prev_amount,
+                "prior_amount_cents": prev_amount,
+                "cumulative_amount_cents": 0,
+            })
+    if trip_filter is not None:
+        entries = [e for e in entries if e["trip_id"] in trip_filter]
+    entries.sort(key=lambda e: (e["ended_at"], e["trip_id"], e["operator_id"]))
+    return {
+        "entries": entries,
+        "gross_total": gross_total,
+        "missing_pairs": missing,
+        "reversed_count": reversed_count,
+        "current_trip_count": len(current_trips),
+    }

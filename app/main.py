@@ -21,12 +21,14 @@ from .clearing import (
     last_seen_trips,
     load_clearing_trips,
     payload_hash as clearing_payload_hash,
+    plan_adjustment_entries,
     prior_operator_totals,
     rule_map_from_canonical,
     split_amount,
     validate_rules as validate_clearing_rules,
 )
 from .config import FareConfig, load_config
+from .correction_preview import no_change_report, simulate_correction
 from .db import Database
 from .disputes import (
     canonical_dispute_payload,
@@ -66,8 +68,14 @@ from .models import (
     ClearingAdjustmentIn,
     ClearingBatchOut,
     ClearingEntryOut,
+    ClearingImpact,
+    ClearingImpactOperatorDelta,
+    ClearingImpactTrip,
     ClearingIn,
     ClearingOperatorTotal,
+    CorrectionPreviewIn,
+    CorrectionPreviewOut,
+    DisputeImpact,
     DisputeIn,
     DisputeOut,
     DisputeResolveIn,
@@ -83,8 +91,10 @@ from .models import (
     NetworkSnapshotOut,
     NetworkValidateIn,
     NetworkValidateOut,
+    PassengerPreview,
     PendingEvent,
     PeriodTotal,
+    PreviewTrip,
     PrivacyEquivalenceClass,
     PrivacyExportIn,
     PrivacyExportOut,
@@ -93,6 +103,7 @@ from .models import (
     QualityEvidenceEvent,
     ReconBatchIn,
     ReconBatchOut,
+    ReconImpactItem,
     ReconResultItem,
     ReconSummary,
     TapEventIn,
@@ -110,7 +121,7 @@ from .privacy import (
     stored_groups_json,
 )
 from .reconcile import CATEGORIES, ExternalRecord, SnapshotTrip, reconcile
-from .settlement import iso_str, normalize_ts, settle_passenger
+from .settlement import Event, iso_str, normalize_ts, settle_passenger
 
 DB_PATH = os.environ.get("DB_PATH", "data/transit.db")
 
@@ -676,6 +687,150 @@ def get_event_hold(
 ) -> EventHoldOut:
     with db.lock():
         return _load_hold(db, hold_id, "created")
+
+
+# ---------------------------------------------------------------------------
+# Correction impact preview (更正影响预览, read-only)
+# ---------------------------------------------------------------------------
+
+
+def _preview_response(cfg: FareConfig, event_id: str, status: str, report: dict):
+    passenger_blocks = [
+        PassengerPreview(
+            passenger_id=b["passenger_id"],
+            old_trips=[PreviewTrip(**t) for t in b["old_trips"]],
+            new_trips=[PreviewTrip(**t) for t in b["new_trips"]],
+            adjustments=[Adjustment(**a) for a in b["adjustments"]],
+            old_total_cents=b["old_total_cents"],
+            new_total_cents=b["new_total_cents"],
+            delta_cents=b["delta_cents"],
+        )
+        for b in report["passengers"]
+    ]
+    recon_impacts = [ReconImpactItem(**i) for i in report["reconciliation_impacts"]]
+    clearing_impacts = [
+        ClearingImpact(
+            base_clearing_id=c["base_clearing_id"],
+            window_start=c["window_start"],
+            window_end=c["window_end"],
+            trips=[
+                ClearingImpactTrip(
+                    trip_id=t["trip_id"],
+                    change_code=t["change_code"],
+                    reason=t["reason"],
+                    old_from_station=t["old_from_station"],
+                    old_to_station=t["old_to_station"],
+                    new_from_station=t["new_from_station"],
+                    new_to_station=t["new_to_station"],
+                    old_gross_cents=t["old_gross_cents"],
+                    new_gross_cents=t["new_gross_cents"],
+                    delta_cents=t["delta_cents"],
+                    operators=[
+                        ClearingImpactOperatorDelta(**o) for o in t["operators"]
+                    ],
+                )
+                for t in c["trips"]
+            ],
+            delta_cents=c["delta_cents"],
+            rule_coverage=c["rule_coverage"],
+            uncovered_station_pairs=c["uncovered_station_pairs"],
+        )
+        for c in report["clearing_impacts"]
+    ]
+    dispute_impacts = [DisputeImpact(**d) for d in report["resolved_dispute_impacts"]]
+    affected_batches = {i.batch_id for i in recon_impacts}
+    affected_clearings = {c.base_clearing_id for c in clearing_impacts
+                          if c.delta_cents != 0 or c.trips or c.rule_coverage == "uncovered"}
+    return CorrectionPreviewOut(
+        event_id=event_id,
+        status=status,
+        currency=cfg.currency,
+        simulated_passengers=report["simulated_passengers"],
+        passengers=passenger_blocks,
+        total_delta_cents=report["total_delta_cents"],
+        reconciliation_impacts=recon_impacts,
+        clearing_impacts=clearing_impacts,
+        resolved_dispute_impacts=dispute_impacts,
+        affected_batch_count=len(affected_batches),
+        affected_clearing_count=len(affected_clearings),
+        affected_resolved_dispute_count=len(dispute_impacts),
+    )
+
+
+@app.post("/events/correction-preview", response_model=CorrectionPreviewOut, status_code=200)
+def correction_preview(
+    body: CorrectionPreviewIn,
+    cfg: FareConfig = Depends(get_config),
+    db: Database = Depends(get_db),
+) -> CorrectionPreviewOut:
+    """Preview the impact of correcting an existing tap event without writing
+    anything. The official settlement rules run purely in memory for the
+    affected passenger(s) (both the old and the new passenger when the payload
+    moves the event between passengers), and every already booked
+    reconciliation batch, clearing chain and resolved dispute affected by the
+    change is listed with its reason. Events, trips, bills, the audit chain and
+    every append-only/frozen table are left untouched; the idempotency and
+    correction semantics of POST /events are unchanged."""
+    if cfg.zone_of(body.station_id) is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown station_id '{body.station_id}'; see GET /config/fares",
+        )
+    occurred = normalize_ts(body.occurred_at)
+    occurred_s = iso_str(occurred)
+
+    # Read-only simulation: only SELECTs run on this path, so a plain
+    # snapshot under the application lock is enough; no write transaction is
+    # ever opened and nothing (events, trips, bills, audit chain or any
+    # append-only/frozen table) can change.
+    with db.lock():
+        existing = db.conn.execute(
+            "SELECT * FROM events WHERE event_id = ?", (body.event_id,)
+        ).fetchone()
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"event_id '{body.event_id}' not found; the preview requires"
+                    " an already received event"
+                ),
+            )
+        if existing["held_id"] is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"event_id '{body.event_id}' is held under review hold"
+                    f" '{existing['held_id']}'; corrections are refused until"
+                    " that hold is released"
+                ),
+            )
+
+        identical = (
+            existing["passenger_id"] == body.passenger_id
+            and existing["station_id"] == body.station_id
+            and existing["tap_type"] == body.tap_type
+            and existing["occurred_at"] == occurred_s
+        )
+        if identical:
+            # Exact same payload as a real correction: nothing would change.
+            return _preview_response(
+                cfg,
+                body.event_id,
+                "no_change",
+                no_change_report(db.conn, body.passenger_id),
+            )
+
+        replacement = Event(
+            event_id=body.event_id,
+            passenger_id=body.passenger_id,
+            station_id=body.station_id,
+            tap_type=body.tap_type,
+            occurred_at=occurred,
+            seq=existing["seq"],
+        )
+        report = simulate_correction(db.conn, cfg, existing, replacement)
+
+    return _preview_response(cfg, body.event_id, "preview", report)
 
 
 def _recon_response(meta: dict, items: list[dict], status: str, currency: str) -> ReconBatchOut:
@@ -1604,12 +1759,10 @@ def create_clearing_adjustment(
         seen_before = last_seen_trips(db.conn, body.base_clearing_id, next_seq)
 
         current_trips = load_clearing_trips(db.conn, window_start, window_end)
-        missing = sorted(
-            {f"{t['from_station']}->{t['to_station']}"
-             for t in current_trips
-             if (t["from_station"], t["to_station"]) not in rules_by_pair}
+        plan = plan_adjustment_entries(
+            rules_by_pair, current_trips, prior, seen_before
         )
-        if missing:
+        if plan["missing_pairs"]:
             # The first closing's rules stay frozen; a correction must never
             # leave a current trip outside their coverage. Open a new first
             # closing (with new rules) instead.
@@ -1617,77 +1770,15 @@ def create_clearing_adjustment(
                 status_code=422,
                 detail=(
                     "no matching frozen operator rule for current in-window trip"
-                    f" station pair(s): {missing}; the first closing's rules are"
-                    " immutable -- open a new first closing with a new clearing_id"
-                    " to settle under different rules"
+                    f" station pair(s): {plan['missing_pairs']}; the first"
+                    " closing's rules are immutable -- open a new first closing"
+                    " with a new clearing_id to settle under different rules"
                 ),
             )
 
-        current_ids = {t["trip_id"] for t in current_trips}
-        vanished_ids = sorted(set(seen_before) - current_ids)
-
-        entries: list[dict] = []
-        gross_total = 0
-        reversed_count = 0
-        prior_ops_by_trip: dict[str, set[str]] = {}
-        for (tid, op) in prior:
-            prior_ops_by_trip.setdefault(tid, set()).add(op)
-        for trip in current_trips:
-            shares = rules_by_pair[(trip["from_station"], trip["to_station"])]
-            targets = split_amount(trip["amount_cents"], shares)
-            gross_total += trip["amount_cents"]
-            # Include operators booked under the trip's previous station pair:
-            # a correction can move the same trip_id onto a different pair with
-            # a different operator set, and the operators dropped by the new
-            # rule must be reversed to zero (target 0) rather than left booked.
-            all_operators = {op for op, _bp in shares} | prior_ops_by_trip.get(
-                trip["trip_id"], set()
-            )
-            for operator_id in sorted(all_operators):
-                prev_amount = prior.get((trip["trip_id"], operator_id), 0)
-                target = targets.get(operator_id, 0)
-                delta = target - prev_amount
-                if delta == 0:
-                    continue
-                entries.append({
-                    "trip_id": trip["trip_id"],
-                    "passenger_id": trip["passenger_id"],
-                    "from_station": trip["from_station"],
-                    "to_station": trip["to_station"],
-                    "ended_at": trip["ended_at"],
-                    "operator_id": operator_id,
-                    "basis_points": None,
-                    "gross_amount_cents": trip["amount_cents"],
-                    "amount_cents": delta,
-                    "prior_amount_cents": prev_amount,
-                    "cumulative_amount_cents": prev_amount + delta,
-                })
-        for trip_id in vanished_ids:
-            last = seen_before[trip_id]
-            # Reverse whatever earlier batches booked, per operator, so the
-            # disappeared trip nets to zero.
-            operators = sorted(
-                op for (tid, op) in prior if tid == trip_id and prior[(tid, op)] != 0
-            )
-            if operators:
-                reversed_count += 1
-            for operator_id in operators:
-                prev_amount = prior[(trip_id, operator_id)]
-                entries.append({
-                    "trip_id": trip_id,
-                    "passenger_id": last["passenger_id"],
-                    "from_station": last["from_station"],
-                    "to_station": last["to_station"],
-                    "ended_at": last["ended_at"],
-                    "operator_id": operator_id,
-                    "basis_points": None,
-                    "gross_amount_cents": 0,
-                    "amount_cents": -prev_amount,
-                    "prior_amount_cents": prev_amount,
-                    "cumulative_amount_cents": 0,
-                })
-        entries.sort(key=lambda e: (e["ended_at"], e["trip_id"], e["operator_id"]))
-
+        entries = plan["entries"]
+        gross_total = plan["gross_total"]
+        reversed_count = plan["reversed_count"]
         net_total = sum(e["amount_cents"] for e in entries)
         created_at = iso_str(datetime.now(timezone.utc))
         # Batch row and its immutable delta rows commit together, in the same

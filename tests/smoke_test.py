@@ -36,6 +36,11 @@ references or overlapping holds, create idempotency/409 conflict, corrections
 refused while held, optimistic release versions, snapshot-mismatch refusal that
 keeps events held, re-settlement by original (occurred_at, seq) with signed
 trip deltas, append-only immutable hold/snapshot/release tables, GET query),
+the correction impact preview endpoint (in-memory settlement of old/new
+passengers with before/after trips and signed adjustments, identical payload
+no_change, 404/409/422 gates, per-item reconciliation/clearing/resolved-dispute
+impacts with reasons, uncovered frozen-rule pairs, fully read-only with no
+audit rows and unchanged /events semantics),
 the append-only hash-chained business audit log (idempotency, verification,
 tamper detection, append-only triggers, atomic rollback),
 and the online GET /admin/backup endpoint (SQLite backup API, live writes keep
@@ -2261,6 +2266,225 @@ def run(client):
             "SELECT COUNT(*) FROM event_hold_releases").fetchone()[0]
         check("one immutable release row per released hold", n_releases >= 2)
 
+    # --- Correction impact preview (更正影响预览, read-only) -------------------
+    def preview(eid, pid, st, tap, ts):
+        return client.post("/events/correction-preview", json={
+            "event_id": eid, "passenger_id": pid, "station_id": st,
+            "tap_type": tap, "occurred_at": ts,
+        })
+
+    # Dedicated preview fixtures, built late so nothing else references them.
+    # PA: two trips on 2026-11-06 (a fresh recon day) 500 / 200.
+    post("pa1", "PA", "S01", "in", "2026-11-06T08:00:00Z")
+    post("pa2", "PA", "S04", "out", "2026-11-06T08:30:00Z")   # 500
+    post("pa3", "PA", "S05", "in", "2026-11-06T09:00:00Z")
+    post("pa4", "PA", "S06", "out", "2026-11-06T09:20:00Z")   # transfer 200
+    # PD: one trip that gets a resolved dispute (300 same-zone).
+    post("pd3", "PD", "S01", "in", "2026-11-07T08:00:00Z")
+    post("pd4", "PD", "S02", "out", "2026-11-07T08:30:00Z")   # 300
+    # PC: transfer pair on 2026-11-08 for clearing (400 after transfer).
+    post("pc3", "PC", "S05", "in", "2026-11-08T06:00:00Z")
+    post("pc4", "PC", "S02", "out", "2026-11-08T07:00:00Z")   # 500
+    post("pc5", "PC", "S01", "in", "2026-11-08T08:00:00Z")
+    post("pc6", "PC", "S04", "out", "2026-11-08T08:30:00Z")   # transfer 400
+
+    preview_recon = client.post("/reconciliations", json={
+        "batch_id": "recon-preview-day",
+        "window_start": "2026-11-06T00:00:00Z",
+        "window_end": "2026-11-07T00:00:00Z",
+        "tolerance_seconds": 600,
+        "records": [
+            {"serial_no": "p1", "passenger_id": "PA",
+             "charged_at": "2026-11-06T08:30:00Z", "amount_cents": 500,
+             "trip_id": "pa1:pa2"},
+        ],
+    })
+    check("preview recon fixture created", preview_recon.status_code == 200)
+
+    client.post("/disputes", json={
+        "dispute_id": "disp-preview", "passenger_id": "PD",
+        "trip_id": "pd3:pd4", "claimed_amount_cents": 300,
+        "reason": "preview dispute",
+    })
+    client.post("/disputes/disp-preview/resolve", json={
+        "expected_version": 1, "approved_amount_cents": 100,
+        "review_note": "partial",
+    })
+
+    preview_clearing = client.post("/clearings", json={
+        "clearing_id": "clr-preview-day",
+        "window_start": "2026-11-08T00:00:00Z",
+        "window_end": "2026-11-09T00:00:00Z",
+        "rules": [
+            {"from_station": "S01", "to_station": "S04", "shares": [
+                {"operator_id": "OA", "basis_points": 5000},
+                {"operator_id": "OB", "basis_points": 5000}]},
+            {"from_station": "S05", "to_station": "S02", "shares": [
+                {"operator_id": "OD", "basis_points": 5000},
+                {"operator_id": "OE", "basis_points": 5000}]},
+        ],
+    })
+    check("preview clearing fixture created", preview_clearing.status_code == 200)
+
+    # Held-event fixture is created before the read-only baseline so the
+    # baseline already includes its (real) writes; only preview calls must
+    # leave the counts untouched.
+    post("ph3", "PH", "S01", "in", "2026-11-09T08:00:00Z")
+    post("ph4", "PH", "S04", "out", "2026-11-09T08:30:00Z")
+    client.post("/events/review-holds", json={
+        "hold_id": "hold-preview-2", "passenger_id": "PH",
+        "event_ids": ["ph3"], "review_reason": "preview held gate",
+    })
+
+    with sqlite3.connect(os.environ["DB_PATH"]) as raw:
+        preview_counts_before = {
+            "events": raw.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+            "trips": raw.execute("SELECT COUNT(*) FROM trips").fetchone()[0],
+            "charges": raw.execute("SELECT COUNT(*) FROM trip_charges").fetchone()[0],
+            "audit": raw.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0],
+        }
+        preview_audit_head = raw.execute(
+            "SELECT MAX(seq) FROM audit_log"
+        ).fetchone()[0]
+
+    # Identical payload -> no_change, current trips echoed, no adjustments.
+    r = preview("pa1", "PA", "S01", "in", "2026-11-06T08:00:00Z")
+    check("identical payload previews no_change",
+          r.status_code == 200 and r.json()["status"] == "no_change")
+    pb = r.json()
+    check("no_change echoes trips with zero deltas",
+          [t["trip_id"] for t in pb["passengers"][0]["new_trips"]]
+          == ["pa1:pa2", "pa3:pa4"]
+          and pb["total_delta_cents"] == 0
+          and not pb["passengers"][0]["adjustments"]
+          and not pb["reconciliation_impacts"]
+          and not pb["clearing_impacts"]
+          and not pb["resolved_dispute_impacts"])
+
+    # Validation gates.
+    check("preview missing event -> 404",
+          preview("no-such-event", "PA", "S01", "in", "2026-11-06T08:00:00Z").status_code == 404)
+    check("preview unknown station -> 422",
+          preview("pa1", "PA", "ZZZ", "in", "2026-11-06T08:00:00Z").status_code == 422)
+    check("preview bad time -> 422",
+          client.post("/events/correction-preview", json={
+              "event_id": "pa1", "passenger_id": "PA", "station_id": "S01",
+              "tap_type": "in", "occurred_at": "nonsense"}).status_code == 422)
+
+    # Amount + station change on pa2 (S04/zone2 -> S07/zone3 => 500 -> 800):
+    # adjustment previewed and the frozen recon batch is flagged.
+    r = preview("pa2", "PA", "S07", "out", "2026-11-06T08:30:00Z")
+    body = r.json()
+    check("changed payload previews preview", r.status_code == 200 and body["status"] == "preview")
+    pa_adj = {a["trip_id"]: a for a in body["passengers"][0]["adjustments"]}
+    check("preview prices the change under official rules",
+          pa_adj["pa1:pa2"]["old_amount_cents"] == 500
+          and pa_adj["pa1:pa2"]["new_amount_cents"] == 800
+          and pa_adj["pa1:pa2"]["delta_cents"] == 300
+          and body["total_delta_cents"] == 300)
+    recon_hit = [i for i in body["reconciliation_impacts"]
+                 if i["batch_id"] == "recon-preview-day"]
+    check("preview flags the frozen reconciliation batch with reason",
+          len(recon_hit) == 1 and recon_hit[0]["trip_id"] == "pa1:pa2"
+          and recon_hit[0]["change_code"] == "stations_changed"
+          and "station pair changes" in recon_hit[0]["reason"])
+
+    # Resolved dispute: repricing pd4 to zone 3 (800) moves the clawback gap.
+    r = preview("pd4", "PD", "S07", "out", "2026-11-07T08:30:00Z")
+    di = r.json()["resolved_dispute_impacts"]
+    check("preview flags the resolved dispute with old/new difference",
+          len(di) == 1 and di[0]["dispute_id"] == "disp-preview"
+          and di[0]["frozen_amount_cents"] == 300 and di[0]["refunded_cents"] == 100
+          and di[0]["old_current_cents"] == 300 and di[0]["new_current_cents"] == 800
+          and di[0]["old_difference_cents"] == -100
+          and di[0]["new_difference_cents"] == -600
+          and di[0]["new_direction"] == "clawback_due")
+
+    # Voiding pd3 (tap-in -> tap-out) removes the disputed trip: top-up.
+    r = preview("pd3", "PD", "S01", "out", "2026-11-07T08:00:00Z")
+    di = r.json()["resolved_dispute_impacts"][0]
+    check("preview reports voided dispute trip as top-up",
+          di["change_code"] == "trip_voided" and di["new_current_cents"] == 0
+          and di["new_difference_cents"] == 200
+          and di["new_direction"] == "top_up_due")
+    check("preview voided trip adjustment is negative",
+          any(a["trip_id"] == "pd3:pd4" and a["delta_cents"] == -300
+              and a["basis"].get("voided")
+              for a in r.json()["passengers"][0]["adjustments"]))
+
+    # Clearing: uncovered station pair reported, nothing assumed bookable.
+    r = preview("pc6", "PC", "S07", "out", "2026-11-08T08:30:00Z")
+    cl = r.json()["clearing_impacts"]
+    check("preview reports uncovered clearing pair",
+          len(cl) == 1 and cl[0]["base_clearing_id"] == "clr-preview-day"
+          and cl[0]["rule_coverage"] == "uncovered"
+          and "S01->S07" in cl[0]["uncovered_station_pairs"])
+
+    # Clearing: covered amount-only change via transfer-window break (+100).
+    r = preview("pc4", "PC", "S02", "out", "2026-11-08T06:29:00Z")
+    cl = r.json()["clearing_impacts"]
+    ct = next(t for t in cl[0]["trips"] if t["trip_id"] == "pc5:pc6")
+    check("preview books clearing target-minus-cumulative deltas",
+          cl[0]["rule_coverage"] == "covered"
+          and ct["change_code"] == "amount_changed"
+          and ct["old_gross_cents"] == 400 and ct["new_gross_cents"] == 500
+          and {o["operator_id"]: o["delta_cents"] for o in ct["operators"]}
+          == {"OA": 50, "OB": 50}
+          and cl[0]["delta_cents"] == 100)
+
+    # Passenger change: both old and new passengers are simulated.
+    r = preview("pa2", "PZ", "S04", "out", "2026-11-06T08:30:00Z")
+    body = r.json()
+    check("preview simulates both passengers on passenger change",
+          body["simulated_passengers"] == ["PA", "PZ"])
+    pblocks = {p["passenger_id"]: p for p in body["passengers"]}
+    check("old passenger loses the trip, new passenger gains no trip",
+          any(a["trip_id"] == "pa1:pa2" and a["delta_cents"] == -500
+              for a in pblocks["PA"]["adjustments"])
+          and pblocks["PZ"]["new_trips"] == [])
+
+    # Held events are rejected, like the real correction endpoint (the
+    # hold-preview-2 fixture was created before the read-only baseline).
+    check("preview refuses held events with 409",
+          preview("ph3", "PH", "S02", "in", "2026-11-09T08:00:00Z").status_code == 409)
+
+    # Read-only guarantee: after every preview, no business/frozen table moved
+    # and the audit chain did not gain a record.
+    with sqlite3.connect(os.environ["DB_PATH"]) as raw:
+        preview_counts_after = {
+            "events": raw.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+            "trips": raw.execute("SELECT COUNT(*) FROM trips").fetchone()[0],
+            "charges": raw.execute("SELECT COUNT(*) FROM trip_charges").fetchone()[0],
+            "audit": raw.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0],
+        }
+        check("previews write no events/trips/charges/audit rows",
+              preview_counts_after == preview_counts_before,
+              f"{preview_counts_before} -> {preview_counts_after}")
+        check("audit head unchanged by previews",
+              raw.execute("SELECT MAX(seq) FROM audit_log").fetchone()[0]
+              == preview_audit_head)
+        check("previewed amounts were never persisted",
+              raw.execute(
+                  "SELECT amount_cents FROM trip_charges WHERE trip_id='pa1:pa2'"
+              ).fetchone()[0] == 500
+              and raw.execute(
+                  "SELECT station_id FROM events WHERE event_id='pa2'"
+              ).fetchone()[0] == "S04"
+              and raw.execute(
+                  "SELECT COUNT(*) FROM trips WHERE passenger_id='PZ'"
+              ).fetchone()[0] == 0)
+
+    client.post("/events/review-holds/hold-preview-2/release",
+                json={"expected_version": 1})
+
+    # The official /events idempotency and correction semantics are intact.
+    r = client.post("/events", json={
+        "event_id": "pa2", "passenger_id": "PA", "station_id": "S04",
+        "tap_type": "out", "occurred_at": "2026-11-06T08:30:00Z",
+    })
+    check("identical /events submission still duplicates after previews",
+          r.status_code == 200 and r.json()["status"] == "duplicate")
+
     # --- Business audit chain ----------------------------------------------------
     # Fetch the whole chain in one page: the default page size is 100 and this
     # run appends well over 100 business records.
@@ -2301,7 +2525,7 @@ def run(client):
     check("one audit per resolved dispute",
           ops.get("dispute_resolved") == n_resolved)
     check("one audit per clearing batch (initial and adjustments)",
-          ops.get("clearing_closed") == n_clearing == 5)
+          ops.get("clearing_closed") == n_clearing)
     check("one audit per stored event review hold",
           ops.get("event_held") == n_holds)
     check("one audit per hold release",
