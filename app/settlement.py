@@ -186,19 +186,16 @@ def charge_row(trip: Trip) -> tuple:
     )
 
 
-def settle_passenger(conn, cfg: FareConfig, passenger_id: str) -> list[dict]:
-    """Recompute a passenger's full settlement, persist it, and return the
-    list of adjustments (per-trip old/new amounts and billing basis).
-
-    Events frozen under a review hold (``held_id IS NOT NULL``) are excluded:
-    while held they take no part in pairing or billing, and their stored
-    pairing status is left untouched until the hold is released."""
+def load_events(conn, passenger_id: str) -> list[Event]:
+    """All of a passenger's events that take part in settlement, in pairing
+    order. Events frozen under a review hold (``held_id IS NOT NULL``) are
+    excluded: while held they take no part in pairing or billing."""
     rows = conn.execute(
         "SELECT * FROM events WHERE passenger_id = ? AND held_id IS NULL"
         " ORDER BY occurred_at, seq",
         (passenger_id,),
     ).fetchall()
-    events = [
+    return [
         Event(
             event_id=r["event_id"],
             passenger_id=r["passenger_id"],
@@ -210,16 +207,11 @@ def settle_passenger(conn, cfg: FareConfig, passenger_id: str) -> list[dict]:
         for r in rows
     ]
 
-    trips, pending = pair_trips(events)
-    price_trips(trips, cfg)
 
-    old_charges = {
-        r["trip_id"]: r["amount_cents"]
-        for r in conn.execute(
-            "SELECT trip_id, amount_cents FROM trip_charges WHERE passenger_id = ?",
-            (passenger_id,),
-        )
-    }
+def compute_adjustments(trips: list[Trip], old_charges: dict[str, int]) -> list[dict]:
+    """Diff freshly priced trips against the previously persisted charges and
+    return the per-trip old/new/delta adjustments. Trips that no longer exist
+    after re-pairing appear as negative voiding adjustments."""
     new_charges = {t.trip_id: t.amount_cents for t in trips}
 
     adjustments: list[dict] = []
@@ -251,6 +243,29 @@ def settle_passenger(conn, cfg: FareConfig, passenger_id: str) -> list[dict]:
                     "basis": {"voided": True, "reason": "trip no longer exists after re-pairing"},
                 }
             )
+    return adjustments
+
+
+def settle_passenger(conn, cfg: FareConfig, passenger_id: str) -> list[dict]:
+    """Recompute a passenger's full settlement, persist it, and return the
+    list of adjustments (per-trip old/new amounts and billing basis).
+
+    Events frozen under a review hold (``held_id IS NOT NULL``) are excluded:
+    while held they take no part in pairing or billing, and their stored
+    pairing status is left untouched until the hold is released."""
+    events = load_events(conn, passenger_id)
+
+    trips, pending = pair_trips(events)
+    price_trips(trips, cfg)
+
+    old_charges = {
+        r["trip_id"]: r["amount_cents"]
+        for r in conn.execute(
+            "SELECT trip_id, amount_cents FROM trip_charges WHERE passenger_id = ?",
+            (passenger_id,),
+        )
+    }
+    adjustments = compute_adjustments(trips, old_charges)
 
     paired_ids = {t.in_event.event_id for t in trips} | {t.out_event.event_id for t in trips}
     pending_by_id = {p.event.event_id: p.reason for p in pending}

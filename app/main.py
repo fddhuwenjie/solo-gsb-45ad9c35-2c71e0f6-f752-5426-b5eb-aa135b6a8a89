@@ -59,6 +59,7 @@ from .event_quality import (
 )
 from .models import (
     Adjustment,
+    ArtefactImpact,
     AuditEntry,
     AuditList,
     AuditVerification,
@@ -68,6 +69,8 @@ from .models import (
     ClearingEntryOut,
     ClearingIn,
     ClearingOperatorTotal,
+    CorrectionPreviewIn,
+    CorrectionPreviewOut,
     DisputeIn,
     DisputeOut,
     DisputeResolveIn,
@@ -85,6 +88,8 @@ from .models import (
     NetworkValidateOut,
     PendingEvent,
     PeriodTotal,
+    PreviewEventPayload,
+    PreviewPassengerSimulation,
     PrivacyEquivalenceClass,
     PrivacyExportIn,
     PrivacyExportOut,
@@ -99,6 +104,7 @@ from .models import (
     TripOut,
 )
 from .network import NetEdge, validate_network
+from .preview import build_correction_preview
 from .privacy import (
     UnmappedStationsError,
     build_export,
@@ -144,7 +150,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Transit Fare Settlement API",
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -367,6 +373,124 @@ def pending_events(
         )
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Correction impact preview (read-only dry-run of the POST /events correction)
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/events/correction-preview",
+    response_model=CorrectionPreviewOut,
+    status_code=200,
+)
+def preview_event_correction(
+    body: CorrectionPreviewIn,
+    cfg: FareConfig = Depends(get_config),
+    db: Database = Depends(get_db),
+) -> CorrectionPreviewOut:
+    """Simulate a correction without persisting anything. The formal
+    settlement rules run in memory for every affected passenger (the event's
+    current owner and, when the passenger changes, the replacement passenger
+    too), so the returned adjustments are exactly what POST /events would
+    produce. Booked artefacts that reference a changed trip -- reconciliation
+    batches, clearing chains and resolved disputes -- are itemised with the
+    cause. Events, trips, charges, the audit chain and every frozen table are
+    only read; no audit record is appended."""
+    if cfg.zone_of(body.station_id) is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown station_id '{body.station_id}'; see GET /config/fares",
+        )
+    occurred = normalize_ts(body.occurred_at)
+    occurred_s = iso_str(occurred)
+
+    with db.lock():
+        row = db.conn.execute(
+            "SELECT * FROM events WHERE event_id = ?", (body.event_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"event_id '{body.event_id}' not found",
+            )
+        # Held events can never be corrected, so there is nothing to preview;
+        # mirrors the POST /events refusal.
+        if row["held_id"] is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"event_id '{body.event_id}' is held under review hold"
+                    f" '{row['held_id']}'; corrections are refused until that"
+                    " hold is released, so no preview is available"
+                ),
+            )
+
+        current = PreviewEventPayload(
+            event_id=row["event_id"],
+            passenger_id=row["passenger_id"],
+            station_id=row["station_id"],
+            tap_type=row["tap_type"],
+            occurred_at=row["occurred_at"],
+        )
+        replacement = PreviewEventPayload(
+            event_id=body.event_id,
+            passenger_id=body.passenger_id,
+            station_id=body.station_id,
+            tap_type=body.tap_type,
+            occurred_at=occurred_s,
+        )
+        identical = (
+            row["passenger_id"] == body.passenger_id
+            and row["station_id"] == body.station_id
+            and row["tap_type"] == body.tap_type
+            and row["occurred_at"] == occurred_s
+        )
+        if identical:
+            # The real submission would be an idempotent duplicate, so the
+            # preview reports no change.
+            return CorrectionPreviewOut(
+                event_id=body.event_id,
+                status="unchanged",
+                current=current,
+                replacement=replacement,
+                event_pairing=row["status"],
+                pending_reason=row["pending_reason"],
+                simulation=[],
+                impacts=[],
+                impact_count=0,
+            )
+
+        result = build_correction_preview(
+            db.conn,
+            cfg,
+            row,
+            body.passenger_id,
+            body.station_id,
+            body.tap_type,
+            occurred,
+        )
+
+    return CorrectionPreviewOut(
+        event_id=body.event_id,
+        status="preview",
+        current=current,
+        replacement=replacement,
+        event_pairing=result["event_pairing"],
+        pending_reason=result["pending_reason"],
+        simulation=[
+            PreviewPassengerSimulation(
+                passenger_id=s["passenger_id"],
+                trip_count_before=s["trip_count_before"],
+                trip_count_after=s["trip_count_after"],
+                adjustments=[Adjustment(**a) for a in s["adjustments"]],
+            )
+            for s in result["simulations"]
+        ],
+        impacts=[ArtefactImpact(**i) for i in result["impacts"]],
+        impact_count=len(result["impacts"]),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -36,6 +36,12 @@ references or overlapping holds, create idempotency/409 conflict, corrections
 refused while held, optimistic release versions, snapshot-mismatch refusal that
 keeps events held, re-settlement by original (occurred_at, seq) with signed
 trip deltas, append-only immutable hold/snapshot/release tables, GET query),
+the correction impact preview endpoint (read-only dry-run of the POST /events
+correction path: per-passenger in-memory simulation identical to the real
+correction, two-passenger simulation on passenger change, identical-payload
+unchanged result, 404/409/422 rejections, itemised stale-artefact impacts on
+reconciliation batches, clearing chains and resolved disputes with causes and
+reasons, no writes to any table and no audit records),
 the append-only hash-chained business audit log (idempotency, verification,
 tamper detection, append-only triggers, atomic rollback),
 and the online GET /admin/backup endpoint (SQLite backup API, live writes keep
@@ -2261,6 +2267,241 @@ def run(client):
             "SELECT COUNT(*) FROM event_hold_releases").fetchone()[0]
         check("one immutable release row per released hold", n_releases >= 2)
 
+    # --- Correction impact preview (更正影响预览) ------------------------------
+    def pvpost(eid, passenger, station, tap, ts):
+        rr = client.post("/events", json={
+            "event_id": eid, "passenger_id": passenger,
+            "station_id": station, "tap_type": tap, "occurred_at": ts,
+        })
+        assert rr.status_code == 200, rr.text
+        return rr.json()
+
+    def preview(eid, passenger, station, tap, ts):
+        return client.post("/events/correction-preview", json={
+            "event_id": eid, "passenger_id": passenger,
+            "station_id": station, "tap_type": tap, "occurred_at": ts,
+        })
+
+    # 2026-10-23, a day no other section uses.
+    pvpost("pv1", "PV1", "S01", "in", "2026-10-23T08:00:00Z")
+    pvpost("pv2", "PV1", "S04", "out", "2026-10-23T08:30:00Z")   # pv1:pv2 = 500
+    pvpost("pv3", "PV2", "S05", "in", "2026-10-23T08:35:00Z")
+    pvpost("pv4", "PV2", "S06", "out", "2026-10-23T09:00:00Z")   # pv3:pv4 = 300
+
+    # Identical payload -> unchanged, empty simulation and impacts.
+    r = preview("pv2", "PV1", "S04", "out", "2026-10-23T08:30:00Z")
+    check("identical payload previews as unchanged",
+          r.status_code == 200 and r.json()["status"] == "unchanged"
+          and r.json()["simulation"] == [] and r.json()["impacts"] == []
+          and r.json()["impact_count"] == 0
+          and r.json()["event_pairing"] == "paired"
+          and r.json()["pending_reason"] is None)
+    r = preview("pv2", "PV1", "S04", "out", "2026-10-23T16:30:00+08:00")
+    check("offset notation of the stored instant is still unchanged",
+          r.json()["status"] == "unchanged")
+
+    # Rejections.
+    check("preview of an unknown event -> 404",
+          preview("no-such-event", "PV1", "S04", "out",
+                  "2026-10-23T08:30:00Z").status_code == 404)
+    check("preview with an unknown station -> 422",
+          preview("pv2", "PV1", "NOPE", "out",
+                  "2026-10-23T08:30:00Z").status_code == 422)
+    r = client.post("/events/correction-preview", json={
+        "event_id": "pv2", "passenger_id": "PV1", "station_id": "S04",
+        "tap_type": "out", "occurred_at": "not-a-timestamp"})
+    check("preview with an illegal timestamp -> 422", r.status_code == 422)
+
+    # Simple re-price: pv2 S04 -> S07 lifts pv1:pv2 from 500 to 800.
+    r = preview("pv2", "PV1", "S07", "out", "2026-10-23T08:30:00Z")
+    body = r.json()
+    check("preview status and payload echo",
+          r.status_code == 200 and body["status"] == "preview"
+          and body["current"] == {"event_id": "pv2", "passenger_id": "PV1",
+                                  "station_id": "S04", "tap_type": "out",
+                                  "occurred_at": "2026-10-23T08:30:00Z"}
+          and body["replacement"]["station_id"] == "S07")
+    check("one simulated passenger for an own-event correction",
+          len(body["simulation"]) == 1
+          and body["simulation"][0]["passenger_id"] == "PV1"
+          and body["simulation"][0]["trip_count_before"] == 1
+          and body["simulation"][0]["trip_count_after"] == 1)
+    adj = body["simulation"][0]["adjustments"]
+    check("preview reprices the trip 500 -> 800 with full basis",
+          len(adj) == 1 and adj[0]["trip_id"] == "pv1:pv2"
+          and adj[0]["old_amount_cents"] == 500
+          and adj[0]["new_amount_cents"] == 800
+          and adj[0]["delta_cents"] == 300
+          and adj[0]["basis"]["zone_fare_rule"] == "zone 1 -> zone 3")
+    check("unreferenced trips hit no booked artefacts",
+          body["impacts"] == [] and body["impact_count"] == 0)
+
+    # Passenger change: both the old and the new passenger are simulated.
+    r = preview("pv1", "PV2", "S01", "in", "2026-10-23T08:40:00Z")
+    body = r.json()
+    sim = {s["passenger_id"]: s for s in body["simulation"]}
+    check("passenger change simulates both passengers",
+          set(sim) == {"PV1", "PV2"})
+    check("old passenger loses the voided trip",
+          [a["trip_id"] for a in sim["PV1"]["adjustments"]] == ["pv1:pv2"]
+          and sim["PV1"]["adjustments"][0]["delta_cents"] == -500
+          and sim["PV1"]["trip_count_before"] == 1
+          and sim["PV1"]["trip_count_after"] == 0)
+    pv2_adj = {a["trip_id"]: a for a in sim["PV2"]["adjustments"]}
+    check("new passenger re-pairs around the moved event",
+          pv2_adj["pv3:pv4"]["delta_cents"] == -300
+          and pv2_adj["pv3:pv4"]["basis"]["voided"] is True
+          and pv2_adj["pv1:pv4"]["new_amount_cents"] == 500
+          and pv2_adj["pv1:pv4"]["delta_cents"] == 500)
+    check("moved event would be paired in the preview",
+          body["event_pairing"] == "paired" and body["pending_reason"] is None)
+
+    # A correction that un-pairs the event projects its pending status.
+    r = preview("pv2", "PV1", "S04", "out", "2026-10-23T07:00:00Z")
+    body = r.json()
+    check("preview projects the corrected event's pending status",
+          body["event_pairing"] == "pending"
+          and body["pending_reason"] == "tap_out_without_tap_in")
+    check("voided trip appears as a negative adjustment",
+          body["simulation"][0]["adjustments"][0]["trip_id"] == "pv1:pv2"
+          and body["simulation"][0]["adjustments"][0]["delta_cents"] == -500
+          and body["simulation"][0]["adjustments"][0]["basis"]["voided"] is True)
+
+    # Booked-artefact impacts: reconciliation batches referencing the trip.
+    # ra1:ra2 is currently 800 (S01->S07); previewing S07 -> S04 drops it to
+    # 500 and changes the station pair, so each of the two recon batches is
+    # flagged once per cause.
+    r = preview("ra2", "RA", "S04", "out", "2026-09-25T08:30:00Z")
+    body = r.json()
+    imp = {(i["artefact"], i["artefact_id"], i["trip_id"], i["cause"]): i
+           for i in body["impacts"]}
+    check("both recon batches flagged for amount and station changes",
+          ("reconciliation", "recon-2026-09-25-a", "ra1:ra2", "amount_changed") in imp
+          and ("reconciliation", "recon-2026-09-25-b", "ra1:ra2", "amount_changed") in imp
+          and ("reconciliation", "recon-2026-09-25-a", "ra1:ra2", "station_changed") in imp
+          and ("reconciliation", "recon-2026-09-25-b", "ra1:ra2", "station_changed") in imp
+          and body["impact_count"] == 4)
+    row = imp[("reconciliation", "recon-2026-09-25-a", "ra1:ra2", "amount_changed")]
+    check("recon impact carries amounts, passenger and reason",
+          row["passenger_id"] == "RA"
+          and row["old_amount_cents"] == 800 and row["new_amount_cents"] == 500
+          and "500" in row["reason"] and "recon-2026-09-25-a" in row["reason"])
+    row = imp[("reconciliation", "recon-2026-09-25-b", "ra1:ra2", "station_changed")]
+    check("station change reason names both pairs",
+          "S01->S07" in row["reason"] and "S01->S04" in row["reason"])
+
+    # A correction that voids a booked trip flags trip_vanished, and the
+    # knock-on re-pricing of a surviving trip is flagged too.
+    r = preview("ra1", "RA", "S01", "in", "2026-09-25T09:30:00Z")
+    body = r.json()
+    imp_keys = {(i["artefact_id"], i["trip_id"], i["cause"]) for i in body["impacts"]}
+    check("voided trip flags recon batches with trip_vanished",
+          ("recon-2026-09-25-a", "ra1:ra2", "trip_vanished") in imp_keys
+          and ("recon-2026-09-25-b", "ra1:ra2", "trip_vanished") in imp_keys)
+    check("surviving trip's re-pricing flags amount_changed",
+          ("recon-2026-09-25-a", "ra3:ra4", "amount_changed") in imp_keys
+          and ("recon-2026-09-25-b", "ra3:ra4", "amount_changed") in imp_keys
+          and body["impact_count"] == 4)
+
+    # Resolved disputes: voiding dp1:dp2 (dp2 moved before dp1) also lifts
+    # dp3:dp4 from 400 to 500 by losing the transfer discount.
+    r = preview("dp2", "DP", "S07", "out", "2026-09-27T07:55:00Z")
+    body = r.json()
+    imp = {(i["artefact_id"], i["trip_id"], i["cause"]): i
+           for i in body["impacts"]}
+    check("resolved dispute on the voided trip is flagged",
+          ("d1", "dp1:dp2", "trip_vanished") in imp
+          and imp[("d1", "dp1:dp2", "trip_vanished")]["artefact"] == "dispute"
+          and imp[("d1", "dp1:dp2", "trip_vanished")]["new_amount_cents"] == 0
+          and "top_up_due 150" in imp[("d1", "dp1:dp2", "trip_vanished")]["reason"])
+    check("cascading transfer loss flags the next resolved dispute",
+          ("d2", "dp3:dp4", "amount_changed") in imp
+          and imp[("d2", "dp3:dp4", "amount_changed")]["old_amount_cents"] == 400
+          and imp[("d2", "dp3:dp4", "amount_changed")]["new_amount_cents"] == 500
+          and "clawback_due 500" in imp[("d2", "dp3:dp4", "amount_changed")]["reason"])
+    check("open disputes are never flagged as booked artefacts",
+          all(i["artefact_id"] != "d5" for i in body["impacts"])
+          and body["impact_count"] == 2)
+
+    # Clearing chain: op2 S04 -> S07 reprices op1:op2 (500 -> 800, onto a
+    # station pair the frozen rules do not cover) and, through the daily cap,
+    # op5:op6 (400 -> 300) and the unbooked op7:op8 (200 -> 0).
+    r = preview("op2", "OP", "S07", "out", "2026-10-10T08:30:00Z")
+    body = r.json()
+    imp = {(i["trip_id"], i["cause"]): i for i in body["impacts"]}
+    check("clearing chain flagged for the amount change",
+          ("op1:op2", "amount_changed") in imp
+          and imp[("op1:op2", "amount_changed")]["artefact"] == "clearing"
+          and imp[("op1:op2", "amount_changed")]["artefact_id"] == "clr-2026-10-10-a")
+    check("uncovered station pair warns about the rejected adjustment",
+          ("op1:op2", "station_changed") in imp
+          and "S01->S07" in imp[("op1:op2", "station_changed")]["reason"]
+          and "rejected" in imp[("op1:op2", "station_changed")]["reason"])
+    check("cap-driven change on another booked trip is flagged too",
+          ("op5:op6", "amount_changed") in imp
+          and imp[("op5:op6", "amount_changed")]["old_amount_cents"] == 400
+          and imp[("op5:op6", "amount_changed")]["new_amount_cents"] == 300)
+    check("trip outside the frozen window is not a clearing impact",
+          ("op7:op8", "amount_changed") not in imp
+          and body["impact_count"] == 3)
+    sim_adj = {a["trip_id"]: a for a in body["simulation"][0]["adjustments"]}
+    check("simulation still covers every re-priced trip",
+          sim_adj["op1:op2"]["new_amount_cents"] == 800
+          and sim_adj["op5:op6"]["new_amount_cents"] == 300
+          and sim_adj["op7:op8"]["new_amount_cents"] == 0)
+
+    # A held event cannot be previewed, exactly like the real correction.
+    r = client.post("/events/review-holds", json={
+        "hold_id": "hold-preview-block", "passenger_id": "PV1",
+        "event_ids": ["pv2"], "review_reason": "preview guard"})
+    check("guard hold created", r.status_code == 200)
+    check("preview of a held event -> 409",
+          preview("pv2", "PV1", "S07", "out",
+                  "2026-10-23T08:30:00Z").status_code == 409)
+    r = client.post("/events/review-holds/hold-preview-block/release",
+                    json={"expected_version": 1})
+    check("guard hold released", r.status_code == 200)
+
+    # The preview is a faithful dry-run: applying the simulated correction
+    # produces exactly the previewed adjustments.
+    pvpost("ap1", "AP", "S01", "in", "2026-10-23T12:00:00Z")
+    pvpost("ap2", "AP", "S04", "out", "2026-10-23T12:30:00Z")   # ap1:ap2 = 500
+    r = preview("ap2", "AP", "S07", "out", "2026-10-23T12:30:00Z")
+    preview_adj = r.json()["simulation"][0]["adjustments"]
+    r = client.post("/events", json={
+        "event_id": "ap2", "passenger_id": "AP", "station_id": "S07",
+        "tap_type": "out", "occurred_at": "2026-10-23T12:30:00Z"})
+    check("the real correction applies after the preview",
+          r.json()["status"] == "corrected")
+    check("preview adjustments equal the real correction's adjustments",
+          r.json()["adjustments"] == preview_adj)
+
+    # Previews write nothing: no events, trips, charges, frozen rows or audit.
+    tables = ("events", "trips", "trip_charges", "audit_log",
+              "recon_batches", "recon_results", "clearing_batches",
+              "clearing_entries", "disputes", "dispute_snapshots", "refunds",
+              "event_holds", "event_hold_snapshots", "event_hold_releases")
+    with sqlite3.connect(os.environ["DB_PATH"]) as raw:
+        counts_before = {
+            t: raw.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            for t in tables
+        }
+    audit_before = client.get("/audit", params={"limit": 1000}).json()["count"]
+    preview("pv2", "PV1", "S07", "out", "2026-10-23T08:30:00Z")
+    preview("ra2", "RA", "S04", "out", "2026-09-25T08:30:00Z")
+    preview("dp2", "DP", "S07", "out", "2026-09-27T07:55:00Z")
+    preview("op2", "OP", "S07", "out", "2026-10-10T08:30:00Z")
+    preview("ap2", "AP", "S04", "out", "2026-10-23T12:30:00Z")
+    with sqlite3.connect(os.environ["DB_PATH"]) as raw:
+        counts_after = {
+            t: raw.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            for t in tables
+        }
+    check("previews write nothing to any table", counts_before == counts_after)
+    check("previews append no audit records",
+          client.get("/audit", params={"limit": 1000}).json()["count"]
+          == audit_before)
+
     # --- Business audit chain ----------------------------------------------------
     # Fetch the whole chain in one page: the default page size is 100 and this
     # run appends well over 100 business records.
@@ -2289,8 +2530,8 @@ def run(client):
         n_hold_releases = raw.execute(
             "SELECT COUNT(*) FROM event_hold_releases").fetchone()[0]
     check("one processed audit per stored event", ops.get("event_processed") == n_events)
-    check("ten corrected audits (a2, ra2, dp2, dp4, dp5, op3 x2, op6, op5, op6 re-pair)",
-          ops.get("event_corrected") == 10)
+    check("eleven corrected audits (a2, ra2, dp2, dp4, dp5, op3 x2, op6, op5, op6 re-pair, ap2)",
+          ops.get("event_corrected") == 11)
     check("one created audit per recon batch", ops.get("recon_batch_created") == n_batches)
     check("one audit per network validation",
           ops.get("network_validated") == n_validations)

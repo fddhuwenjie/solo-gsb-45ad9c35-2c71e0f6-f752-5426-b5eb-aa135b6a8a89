@@ -659,3 +659,54 @@ class EventHoldOut(BaseModel):
     # billing at hold time; present on the POST response (and frozen in storage).
     adjustments: list[Adjustment] = []
     trip_change_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Correction impact preview (更正影响预览, read-only dry-run of POST /events)
+# ---------------------------------------------------------------------------
+
+
+class CorrectionPreviewIn(BaseModel):
+    event_id: str = Field(min_length=1, max_length=128)
+    passenger_id: str = Field(min_length=1, max_length=128)
+    station_id: str = Field(min_length=1, max_length=64)
+    tap_type: Literal["in", "out"]
+    occurred_at: datetime  # any ISO-8601 offset accepted, normalised to UTC
+
+
+class PreviewEventPayload(BaseModel):
+    event_id: str
+    passenger_id: str
+    station_id: str
+    tap_type: Literal["in", "out"]
+    occurred_at: str       # ISO-8601, normalised to UTC
+
+
+class PreviewPassengerSimulation(BaseModel):
+    passenger_id: str
+    trip_count_before: int
+    trip_count_after: int
+    adjustments: list[Adjustment]  # exactly what the real correction would return
+
+
+class ArtefactImpact(BaseModel):
+    artefact: Literal["reconciliation", "clearing", "dispute"]
+    artefact_id: str       # recon batch_id / clearing root id / dispute_id
+    passenger_id: str
+    trip_id: str
+    cause: Literal["trip_vanished", "amount_changed", "station_changed"]
+    old_amount_cents: int
+    new_amount_cents: int  # 0 when the trip would vanish
+    reason: str
+
+
+class CorrectionPreviewOut(BaseModel):
+    event_id: str
+    status: Literal["preview", "unchanged"]
+    current: PreviewEventPayload      # the stored event payload
+    replacement: PreviewEventPayload  # the submitted replacement, UTC-normalised
+    event_pairing: Literal["paired", "pending"]
+    pending_reason: str | None = None
+    simulation: list[PreviewPassengerSimulation]
+    impacts: list[ArtefactImpact]
+    impact_count: int
